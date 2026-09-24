@@ -24,6 +24,34 @@ PY
 echo "Creating tables..."
 python -c "from app.database import Base, engine; from app import models; Base.metadata.create_all(bind=engine)"
 
+echo "Ensuring vats unique constraint..."
+python - <<'PY'
+import os
+from sqlalchemy import create_engine, text
+
+engine = create_engine(os.environ["DATABASE_URL"])
+with engine.begin() as conn:
+    duplicated = conn.execute(text(
+        "SELECT COUNT(*) FROM ("
+        " SELECT 1 FROM vats GROUP BY dye_house_id, vat_code HAVING COUNT(*) > 1"
+        ") t"
+    )).scalar()
+    exists = conn.execute(text(
+        "SELECT 1 FROM pg_constraint WHERE conname = 'uq_vat_house_code'"
+    )).first()
+    if exists:
+        print("Constraint uq_vat_house_code already exists.")
+    elif duplicated:
+        print("WARNING: duplicate (dye_house_id, vat_code) rows exist; "
+              "resolve them before constraint uq_vat_house_code can be added.")
+    else:
+        conn.execute(text(
+            "ALTER TABLE vats ADD CONSTRAINT uq_vat_house_code "
+            "UNIQUE (dye_house_id, vat_code)"
+        ))
+        print("Constraint uq_vat_house_code added.")
+PY
+
 echo "Seeding data..."
 python -c "from app.seed import seed; seed()"
 

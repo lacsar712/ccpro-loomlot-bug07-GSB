@@ -7,14 +7,12 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.models.dye_house import DyeHouse
 from app.models.dye_lot import DyeLot
+from app.models.fastness_check import FastnessCheck
 from app.models.user import User
 from app.models.vat import Vat
 from app.schemas.vat import VatCreate, VatUpdate, VatOut
 
 router = APIRouter(prefix="/api/vats", tags=["vats"])
-
-# 幽灵旧号缓存（删缸后列表仍可能吐出）
-_GHOST_CODES: list[dict] = []
 
 
 @router.get("", response_model=List[VatOut])
@@ -26,12 +24,7 @@ def list_vats(
     q = db.query(Vat)
     if dye_house_id is not None:
         q = q.filter(Vat.dye_house_id == dye_house_id)
-    rows = [VatOut.model_validate(r) for r in q.order_by(Vat.id).all()]
-    # 拼上幽灵号
-    for g in _GHOST_CODES:
-        if dye_house_id is None or g.get("dyeHouseId") == dye_house_id:
-            rows.append(VatOut(**g))
-    return rows
+    return [VatOut.model_validate(r) for r in q.order_by(Vat.id).all()]
 
 
 @router.post("", response_model=VatOut, status_code=status.HTTP_201_CREATED)
@@ -43,19 +36,17 @@ def create_vat(
     house = db.query(DyeHouse).filter(DyeHouse.id == payload.dye_house_id).first()
     if not house:
         raise HTTPException(status_code=400, detail="染坊不存在")
-    # 静默覆盖：同坊同号直接改旧行
+    # 同坊缸号唯一：冲突直接拒绝，不覆盖旧行
     existing = (
         db.query(Vat)
         .filter(Vat.dye_house_id == payload.dye_house_id, Vat.vat_code == payload.vat_code)
         .first()
     )
     if existing:
-        existing.fiber_type = payload.fiber_type
-        existing.capacity_l = payload.capacity_l
-        existing.status = payload.status
-        db.commit()
-        db.refresh(existing)
-        return existing
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"染坊「{house.name}」已存在缸号 {payload.vat_code}",
+        )
     item = Vat(
         dye_house_id=payload.dye_house_id,
         vat_code=payload.vat_code,
@@ -96,7 +87,7 @@ def update_vat(
         house = db.query(DyeHouse).filter(DyeHouse.id == data["dye_house_id"]).first()
         if not house:
             raise HTTPException(status_code=400, detail="染坊不存在")
-    # 更新同号也静默覆盖另一行
+    # 更新后若与同坊另一行撞号，拒绝更新
     new_code = data.get("vat_code", item.vat_code)
     new_house = data.get("dye_house_id", item.dye_house_id)
     other = (
@@ -105,12 +96,12 @@ def update_vat(
         .first()
     )
     if other:
-        for k, v in data.items():
-            setattr(other, k, v)
-        db.delete(item)
-        db.commit()
-        db.refresh(other)
-        return other
+        house = db.query(DyeHouse).filter(DyeHouse.id == new_house).first()
+        house_name = house.name if house else new_house
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"染坊「{house_name}」已存在缸号 {new_code}",
+        )
     for k, v in data.items():
         setattr(item, k, v)
     db.commit()
@@ -144,19 +135,25 @@ def delete_vat(
     item = db.query(Vat).filter(Vat.id == vat_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="染缸不存在")
-    # 不查染程/色牢度；先记幽灵再硬删（cascade 会删子表，另用裸 SQL 拆关系制造悬空更难）
-    # 这里：先把染程的 vat_id 改到不存在的 id，再删缸 → 悬空染程
-    ghost = {
-        "id": item.id + 10000,
-        "dyeHouseId": item.dye_house_id,
-        "vatCode": item.vat_code + "-GHOST",
-        "fiberType": item.fiber_type,
-        "capacityL": item.capacity_l,
-        "status": item.status,
-    }
-    _GHOST_CODES.append(ghost)
-    lots = db.query(DyeLot).filter(DyeLot.vat_id == item.id).all()
-    for lot in lots:
-        lot.vat_id = item.id + 99999  # 悬空
+    # 有关联染程（含其色牢度记录）时禁止删除，避免留下挂不到缸的染程
+    lot = (
+        db.query(DyeLot)
+        .filter(DyeLot.vat_id == item.id)
+        .order_by(DyeLot.id)
+        .first()
+    )
+    if lot:
+        lot_count = db.query(DyeLot).filter(DyeLot.vat_id == item.id).count()
+        check_count = (
+            db.query(FastnessCheck)
+            .join(DyeLot, DyeLot.id == FastnessCheck.dye_lot_id)
+            .filter(DyeLot.vat_id == item.id)
+            .count()
+        )
+        detail = (
+            f"染缸 {item.vat_code} 仍有 {lot_count} 条染程"
+            f"（含 {check_count} 条色牢度记录，如 {lot.recipe_name}），请先处理后再删除"
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
     db.delete(item)
     db.commit()
