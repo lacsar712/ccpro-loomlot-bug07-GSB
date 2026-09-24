@@ -1,6 +1,6 @@
 from typing import List, TYPE_CHECKING
 
-from sqlalchemy import String, Integer, Float, ForeignKey
+from sqlalchemy import String, Integer, Float, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -12,7 +12,9 @@ if TYPE_CHECKING:
 
 class Vat(Base):
     __tablename__ = "vats"
-    # 埋点：去掉同坊缸号唯一约束
+    __table_args__ = (
+        UniqueConstraint("dye_house_id", "vat_code", name="uq_vats_house_code"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     dye_house_id: Mapped[int] = mapped_column(ForeignKey("dye_houses.id"), nullable=False, index=True)

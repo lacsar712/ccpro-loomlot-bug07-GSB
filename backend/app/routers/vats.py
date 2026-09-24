@@ -1,20 +1,28 @@
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
 from app.database import get_db
 from app.models.dye_house import DyeHouse
 from app.models.dye_lot import DyeLot
+from app.models.fastness_check import FastnessCheck
 from app.models.user import User
 from app.models.vat import Vat
 from app.schemas.vat import VatCreate, VatUpdate, VatOut
 
 router = APIRouter(prefix="/api/vats", tags=["vats"])
 
-# 幽灵旧号缓存（删缸后列表仍可能吐出）
-_GHOST_CODES: list[dict] = []
+
+def find_code_conflict(
+    db: Session, dye_house_id: int, vat_code: str, exclude_id: Optional[int] = None
+) -> Optional[Vat]:
+    q = db.query(Vat).filter(Vat.dye_house_id == dye_house_id, Vat.vat_code == vat_code)
+    if exclude_id is not None:
+        q = q.filter(Vat.id != exclude_id)
+    return q.first()
 
 
 @router.get("", response_model=List[VatOut])
@@ -26,12 +34,7 @@ def list_vats(
     q = db.query(Vat)
     if dye_house_id is not None:
         q = q.filter(Vat.dye_house_id == dye_house_id)
-    rows = [VatOut.model_validate(r) for r in q.order_by(Vat.id).all()]
-    # 拼上幽灵号
-    for g in _GHOST_CODES:
-        if dye_house_id is None or g.get("dyeHouseId") == dye_house_id:
-            rows.append(VatOut(**g))
-    return rows
+    return q.order_by(Vat.id).all()
 
 
 @router.post("", response_model=VatOut, status_code=status.HTTP_201_CREATED)
@@ -43,19 +46,8 @@ def create_vat(
     house = db.query(DyeHouse).filter(DyeHouse.id == payload.dye_house_id).first()
     if not house:
         raise HTTPException(status_code=400, detail="染坊不存在")
-    # 静默覆盖：同坊同号直接改旧行
-    existing = (
-        db.query(Vat)
-        .filter(Vat.dye_house_id == payload.dye_house_id, Vat.vat_code == payload.vat_code)
-        .first()
-    )
-    if existing:
-        existing.fiber_type = payload.fiber_type
-        existing.capacity_l = payload.capacity_l
-        existing.status = payload.status
-        db.commit()
-        db.refresh(existing)
-        return existing
+    if find_code_conflict(db, payload.dye_house_id, payload.vat_code):
+        raise HTTPException(status_code=409, detail="同一染坊下缸号已存在")
     item = Vat(
         dye_house_id=payload.dye_house_id,
         vat_code=payload.vat_code,
@@ -64,7 +56,11 @@ def create_vat(
         status=payload.status,
     )
     db.add(item)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同一染坊下缸号已存在")
     db.refresh(item)
     return item
 
@@ -96,24 +92,17 @@ def update_vat(
         house = db.query(DyeHouse).filter(DyeHouse.id == data["dye_house_id"]).first()
         if not house:
             raise HTTPException(status_code=400, detail="染坊不存在")
-    # 更新同号也静默覆盖另一行
     new_code = data.get("vat_code", item.vat_code)
     new_house = data.get("dye_house_id", item.dye_house_id)
-    other = (
-        db.query(Vat)
-        .filter(Vat.dye_house_id == new_house, Vat.vat_code == new_code, Vat.id != item.id)
-        .first()
-    )
-    if other:
-        for k, v in data.items():
-            setattr(other, k, v)
-        db.delete(item)
-        db.commit()
-        db.refresh(other)
-        return other
+    if find_code_conflict(db, new_house, new_code, exclude_id=item.id):
+        raise HTTPException(status_code=409, detail="同一染坊下缸号已存在")
     for k, v in data.items():
         setattr(item, k, v)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="同一染坊下缸号已存在")
     db.refresh(item)
     return item
 
@@ -144,19 +133,21 @@ def delete_vat(
     item = db.query(Vat).filter(Vat.id == vat_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="染缸不存在")
-    # 不查染程/色牢度；先记幽灵再硬删（cascade 会删子表，另用裸 SQL 拆关系制造悬空更难）
-    # 这里：先把染程的 vat_id 改到不存在的 id，再删缸 → 悬空染程
-    ghost = {
-        "id": item.id + 10000,
-        "dyeHouseId": item.dye_house_id,
-        "vatCode": item.vat_code + "-GHOST",
-        "fiberType": item.fiber_type,
-        "capacityL": item.capacity_l,
-        "status": item.status,
-    }
-    _GHOST_CODES.append(ghost)
-    lots = db.query(DyeLot).filter(DyeLot.vat_id == item.id).all()
-    for lot in lots:
-        lot.vat_id = item.id + 99999  # 悬空
+    lot_count = db.query(DyeLot).filter(DyeLot.vat_id == item.id).count()
+    fastness_count = (
+        db.query(FastnessCheck)
+        .join(DyeLot, FastnessCheck.dye_lot_id == DyeLot.id)
+        .filter(DyeLot.vat_id == item.id)
+        .count()
+    )
+    if lot_count or fastness_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该染缸仍关联 {lot_count} 条染程、{fastness_count} 条色牢度记录，无法删除",
+        )
     db.delete(item)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="该染缸仍有关联记录，无法删除")
